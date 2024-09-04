@@ -1,56 +1,36 @@
+use crate::agent::{Agent, AgentQueueMap};
+use crate::interaction::Interaction;
+use crate::queue::Queue;
 use deadpool_postgres::tokio_postgres::types::Type;
 use deadpool_postgres::Pool;
-use queue::Queue;
 use std::collections::HashMap;
 use std::hash::Hash;
+use std::sync::{Arc, RwLock};
 use uuid::Uuid;
-
-mod queue;
 
 pub struct Core {
     pool: Pool,
-    pub agents: HashMap<Uuid, Agent>,
-    pub interactions: HashMap<Uuid, Interaction>,
-    pub interactions_queues: HashMap<Uuid, Queue>,
-    pub agents_queues: HashMap<Uuid, Queue>,
-}
-
-#[derive(Debug)]
-pub struct Agent {
-    id: Uuid,
-    queues: HashMap<Uuid, i32>,
-    state: i32,
-}
-#[derive(Debug)]
-pub struct Interaction {
-    id: Uuid,
-    queues: HashMap<Uuid, i32>,
-    state: i32,
+    pub queues: RwLock<HashMap<Uuid, RwLock<Queue>>>,
+    pub agents: RwLock<HashMap<Uuid, Arc<RwLock<Agent>>>>,
+    pub interactions: RwLock<HashMap<Uuid, Arc<RwLock<Interaction>>>>,
 }
 
 impl Core {
-    pub fn new(pool: Pool) -> Self {
-        Self {
-            pool,
-            agents: HashMap::with_capacity(100),
-            interactions: HashMap::with_capacity(100),
-            interactions_queues: HashMap::with_capacity(100),
-            agents_queues: HashMap::with_capacity(100),
-        }
-    }
+    pub async fn new(pool: Pool) -> Self {
+        let queues = RwLock::new(HashMap::with_capacity(100));
+        let agents = RwLock::new(HashMap::with_capacity(100));
+        let interactions = RwLock::new(HashMap::with_capacity(100));
+        let client = pool.get().await.unwrap();
 
-    pub async fn init(&mut self) {
-        let client = self.pool.get().await.unwrap();
-
-        let _queues = client.query("SELECT * FROM queues", &[]).await.unwrap();
-        for row in _queues.iter() {
-            self.interactions_queues.insert(
+        let rows = client.query("SELECT * FROM queues", &[]).await.unwrap();
+        for row in rows.iter() {
+            queues.write().unwrap().insert(
                 row.get("id"),
-                Queue::new(row.get("id"), row.get("algorithm"), row.get("channel")),
-            );
-            self.agents_queues.insert(
-                row.get("id"),
-                Queue::new(row.get("id"), row.get("algorithm"), row.get("channel")),
+                RwLock::new(Queue::new(
+                    row.get("id"),
+                    row.get("algorithm"),
+                    row.get("channel"),
+                )),
             );
         }
 
@@ -62,48 +42,42 @@ impl Core {
             .await
             .unwrap();
 
-        let _agents = client.query("SELECT * FROM agents", &[]).await.unwrap();
-        for _agent in _agents.iter() {
-            let agent_id: Uuid = _agent.get("uuid");
+        let rows = client.query("SELECT * FROM agents", &[]).await.unwrap();
+        for row in rows.iter() {
+            let agent_id: Uuid = row.get("uuid");
             let _queues = client
                 .query(&_assigned_queues_statement, &[&agent_id])
                 .await
                 .unwrap();
 
-            let mut assigned_queues: HashMap<Uuid, i32> = HashMap::new();
-            _queues.iter().for_each(|row| {
-                assigned_queues.insert(row.get("id"), row.get("priority"));
-            });
-            self.agents.insert(
-                _agent.get("id"),
-                Agent::new(_agent.get("id"), assigned_queues),
+            let mut assigned_queues: HashMap<Uuid, AgentQueueMap> = HashMap::new();
+
+            for _queue in _queues.iter() {
+                assigned_queues
+                    .insert(row.get("id"), AgentQueueMap::new(row.get("priority"), true));
+            }
+
+            agents.write().unwrap().insert(
+                row.get("id"),
+                Arc::new(RwLock::new(Agent::new(row.get("id"), assigned_queues))),
             );
         }
-    }
-
-    pub fn queue_exist(&self, id: &Uuid) -> bool {
-        match self.interactions_queues.get(id) {
-            None => false,
-            Some(_) => true,
-        }
-    }
-}
-
-impl Interaction {
-    pub fn new(id: Uuid, state: i32) -> Self {
         Self {
-            id,
-            queues: HashMap::with_capacity(10),
-            state,
-        }
-    }
-}
-impl Agent {
-    fn new(id: Uuid, queues: HashMap<Uuid, i32>) -> Self {
-        Self {
-            id,
+            pool,
             queues,
-            state: -1,
+            agents,
+            interactions,
         }
+    }
+
+    pub fn agent_exist(&self, id: &Uuid) -> bool {
+        self.agents.read().unwrap().contains_key(id)
+    }
+    pub fn queue_exist(&self, id: &Uuid) -> bool {
+        self.queues.read().unwrap().contains_key(id)
+    }
+
+    pub fn interaction_exist(&self, id: &Uuid) -> bool {
+        self.interactions.read().unwrap().contains_key(id)
     }
 }
